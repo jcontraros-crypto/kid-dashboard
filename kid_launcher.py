@@ -1,18 +1,20 @@
 """
-Kid Safe Launcher
-A simple fullscreen Python/Tkinter launcher for Windows that only shows parent-approved apps and websites.
-
+Kid Safe Launcher - Manual Lockdown Edition
 Run: python kid_launcher.py
 Default parent PIN: 1234
-Change it from Parent Mode after launch.
+
+This is a kid-safe, fullscreen dashboard for Windows. It launches only approved
+apps/websites, blocks common escape key combinations while running, and requires
+a parent PIN to exit or configure.
 """
 
+import ctypes
+import hashlib
 import json
 import os
-import sys
-import hashlib
 import subprocess
-import webbrowser
+import sys
+import threading
 import time
 from pathlib import Path
 from tkinter import Tk, Toplevel, StringVar, BooleanVar, messagebox, filedialog
@@ -27,39 +29,31 @@ DEFAULT_CONFIG = {
     "kid_name": "Kids",
     "lock_fullscreen": True,
     "always_on_top": True,
+    "block_escape_keys": True,
     "use_edge_app_mode_for_websites": True,
     "theme": {
         "background": "#eaf7ff",
         "card": "#ffffff",
         "primary": "#2563eb",
         "text": "#1f2937",
-        "muted": "#64748b"
+        "muted": "#64748b",
+        "danger": "#dc2626",
     },
     "items": [
-        {
-            "name": "PBS Kids",
-            "type": "website",
-            "target": "https://pbskids.org",
-            "emoji": "🌈"
-        },
-        {
-            "name": "Khan Academy Kids",
-            "type": "website",
-            "target": "https://learn.khanacademy.org/khan-academy-kids/",
-            "emoji": "📚"
-        },
-        {
-            "name": "Paint",
-            "type": "app",
-            "target": "mspaint.exe",
-            "emoji": "🎨"
-        }
-    ]
+        {"name": "PBS Kids", "type": "website", "target": "https://pbskids.org", "emoji": "🌈"},
+        {"name": "Khan Academy Kids", "type": "website", "target": "https://learn.khanacademy.org/khan-academy-kids/", "emoji": "📚"},
+        {"name": "Paint", "type": "app", "target": "mspaint.exe", "emoji": "🎨"},
+    ],
 }
 
 
 def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def save_config(config: dict) -> None:
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
 
 def load_config() -> dict:
@@ -80,65 +74,142 @@ def load_config() -> dict:
         return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
-def save_config(config: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-
-
 def find_edge() -> str | None:
     candidates = [
-        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+        r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe",
     ]
     for c in candidates:
-        if c and Path(c).exists():
-            return c
+        p = Path(os.path.expandvars(c))
+        if p.exists():
+            return str(p)
     return None
 
 
-# Best-effort Windows window control. If it fails, the launcher still works;
-# it just cannot force the approved window to maximize/focus.
-def bring_process_windows_forward(pid: int | None, fullscreen: bool = False) -> None:
+def bring_pid_to_front(pid: int, fullscreen: bool = True) -> None:
     if os.name != "nt" or not pid:
         return
     try:
         import ctypes
         from ctypes import wintypes
-
         user32 = ctypes.windll.user32
-        SW_SHOWMAXIMIZED = 3
+        kernel32 = ctypes.windll.kernel32
         SW_RESTORE = 9
-        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        SW_MAXIMIZE = 3
         hwnds = []
+        EnumWindows = user32.EnumWindows
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def callback(hwnd, lparam):
             if not user32.IsWindowVisible(hwnd):
                 return True
-            found_pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
-            if found_pid.value == pid:
+            proc_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid:
                 hwnds.append(hwnd)
             return True
 
-        user32.EnumWindows(EnumWindowsProc(callback), 0)
+        for _ in range(30):
+            hwnds.clear()
+            EnumWindows(EnumWindowsProc(callback), 0)
+            if hwnds:
+                break
+            time.sleep(0.15)
         for hwnd in hwnds:
-            user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED if fullscreen else SW_RESTORE)
-            user32.BringWindowToTop(hwnd)
+            user32.ShowWindow(hwnd, SW_MAXIMIZE if fullscreen else SW_RESTORE)
             user32.SetForegroundWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
     except Exception:
         pass
 
 
-def delayed_focus_process(pid: int | None, fullscreen: bool = True, attempts: int = 12, delay: float = 0.35) -> None:
-    import threading
+class KeyboardBlocker:
+    """Blocks common Windows escape shortcuts while this launcher is running.
 
-    def worker():
-        for _ in range(attempts):
-            time.sleep(delay)
-            bring_process_windows_forward(pid, fullscreen=fullscreen)
+    This catches Alt+Tab, Alt+Esc, Alt+F4, Ctrl+Esc, and the Windows keys.
+    Windows intentionally does not allow normal apps to block Ctrl+Alt+Del.
+    """
 
-    threading.Thread(target=worker, daemon=True).start()
+    def __init__(self):
+        self.enabled = False
+        self.hooked = False
+        self.thread = None
+        self._hook = None
+        self._proc = None
+
+    def start(self):
+        if os.name != "nt" or self.hooked:
+            return
+        self.enabled = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.enabled = False
+        if os.name == "nt" and self._hook:
+            try:
+                ctypes.windll.user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+        self._hook = None
+        self.hooked = False
+
+    def _run(self):
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            WH_KEYBOARD_LL = 13
+            WM_KEYDOWN = 0x0100
+            WM_SYSKEYDOWN = 0x0104
+            VK_TAB = 0x09
+            VK_ESCAPE = 0x1B
+            VK_F4 = 0x73
+            VK_LWIN = 0x5B
+            VK_RWIN = 0x5C
+            VK_MENU = 0x12  # Alt
+            VK_CONTROL = 0x11
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", ctypes.c_ulong),
+                    ("scanCode", ctypes.c_ulong),
+                    ("flags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ]
+
+            LowLevelKeyboardProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+            def is_down(vk):
+                return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+            def hook_proc(nCode, wParam, lParam):
+                if nCode == 0 and self.enabled and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk = kb.vkCode
+                    alt = is_down(VK_MENU)
+                    ctrl = is_down(VK_CONTROL)
+                    blocked = (
+                        vk in (VK_LWIN, VK_RWIN) or
+                        (alt and vk in (VK_TAB, VK_ESCAPE, VK_F4)) or
+                        (ctrl and vk == VK_ESCAPE)
+                    )
+                    if blocked:
+                        return 1
+                return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+            self._proc = LowLevelKeyboardProc(hook_proc)
+            self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
+            self.hooked = bool(self._hook)
+            msg = ctypes.wintypes.MSG()
+            while self.enabled:
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                time.sleep(0.01)
+        except Exception:
+            self.hooked = False
 
 
 class PinDialog(Toplevel):
@@ -146,22 +217,21 @@ class PinDialog(Toplevel):
         super().__init__(parent)
         self.result = None
         self.title(title)
-        self.geometry("340x180")
+        self.geometry("360x190")
         self.resizable(False, False)
-        self.configure(bg="#ffffff")
+        self.configure(bg="white")
         self.transient(parent)
         self.grab_set()
-
-        ttk.Label(self, text="Enter parent PIN", font=("Segoe UI", 15, "bold")).pack(pady=(22, 8))
+        self.focus_force()
+        tk.Label(self, text="Enter parent PIN", font=("Segoe UI", 16, "bold"), bg="white").pack(pady=(22, 8))
         self.pin = StringVar()
-        entry = ttk.Entry(self, textvariable=self.pin, show="•", font=("Segoe UI", 16), justify="center")
+        entry = tk.Entry(self, textvariable=self.pin, show="•", font=("Segoe UI", 17), justify="center")
         entry.pack(padx=35, fill="x")
         entry.focus_set()
-
-        btns = ttk.Frame(self)
+        btns = tk.Frame(self, bg="white")
         btns.pack(pady=18)
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
-        ttk.Button(btns, text="Unlock", command=self.ok).pack(side="left", padx=6)
+        tk.Button(btns, text="Cancel", command=self.destroy, width=10).pack(side="left", padx=6)
+        tk.Button(btns, text="Unlock", command=self.ok, width=10).pack(side="left", padx=6)
         self.bind("<Return>", lambda _e: self.ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.wait_window(self)
@@ -182,16 +252,21 @@ class KidLauncher:
         self.root.bind("<Control-q>", lambda e: self.ask_exit())
         self.root.bind("<Control-p>", lambda e: self.open_parent_mode())
         self.root.bind("<F12>", lambda e: self.open_parent_mode())
+        self.root.bind_all("<KeyPress-Super_L>", lambda e: "break")
+        self.root.bind_all("<KeyPress-Super_R>", lambda e: "break")
         self.child_mode = False
         self.active_process = None
         self.return_panel = None
+        self.keyboard_blocker = KeyboardBlocker()
+        if self.config.get("block_escape_keys", True):
+            self.keyboard_blocker.start()
         self.apply_window_mode()
         self.build_ui()
         self.create_return_panel()
         self.keep_front()
 
     def theme(self, key):
-        return self.config.get("theme", DEFAULT_CONFIG["theme"]).get(key, DEFAULT_CONFIG["theme"][key])
+        return self.config.get("theme", DEFAULT_CONFIG["theme"]).get(key, DEFAULT_CONFIG["theme"].get(key))
 
     def apply_window_mode(self):
         self.root.configure(bg=self.theme("background"))
@@ -202,357 +277,338 @@ class KidLauncher:
             self.root.geometry("1000x700")
 
     def keep_front(self):
-        # Keep dashboard on top only while the child is choosing from the dashboard.
-        # Once an approved app/site opens, the dashboard goes behind it and a small
-        # floating Return button is shown instead.
-        if not self.child_mode and self.config.get("always_on_top", True):
-            try:
+        try:
+            # Keep dashboard as the safe background. When no child app is active, keep it in front.
+            if not self.child_mode and self.config.get("always_on_top", True):
                 self.root.attributes("-topmost", True)
                 self.root.lift()
                 self.root.focus_force()
-            except Exception:
-                pass
-        self.root.after(2500, self.keep_front)
+        except Exception:
+            pass
+        self.root.after(1200, self.keep_front)
 
     def create_return_panel(self):
-        if self.return_panel is not None:
-            try:
+        try:
+            if self.return_panel:
                 self.return_panel.destroy()
-            except Exception:
-                pass
-        self.return_panel = Toplevel(self.root)
-        self.return_panel.withdraw()
-        self.return_panel.overrideredirect(True)
-        self.return_panel.attributes("-topmost", True)
-        self.return_panel.configure(bg=self.theme("primary"))
-        btn = tk.Button(
-            self.return_panel,
-            text="← Dashboard",
-            command=self.return_to_dashboard,
-            bg=self.theme("primary"),
-            fg="white",
-            activebackground=self.theme("primary"),
-            activeforeground="white",
-            relief="flat",
-            padx=18,
-            pady=10,
-            font=("Segoe UI", 12, "bold"),
-            cursor="hand2",
-        )
-        btn.pack()
+            self.return_panel = Toplevel(self.root)
+            self.return_panel.withdraw()
+            self.return_panel.overrideredirect(True)
+            self.return_panel.attributes("-topmost", True)
+            self.return_panel.configure(bg=self.theme("primary"))
+            btn = tk.Button(
+                self.return_panel,
+                text="← Dashboard",
+                command=self.return_to_dashboard,
+                bg=self.theme("primary"),
+                fg="white",
+                activebackground=self.theme("primary"),
+                activeforeground="white",
+                relief="flat",
+                padx=12,
+                pady=8,
+                font=("Segoe UI", 12, "bold"),
+                cursor="hand2",
+            )
+            btn.pack()
+        except Exception:
+            pass
 
     def show_return_panel(self):
-        if self.return_panel is None:
-            self.create_return_panel()
+        if not self.return_panel:
+            return
         try:
-            self.return_panel.update_idletasks()
-            w = self.return_panel.winfo_reqwidth()
-            h = self.return_panel.winfo_reqheight()
-            screen_h = self.root.winfo_screenheight()
-            self.return_panel.geometry(f"{w}x{h}+16+{screen_h - h - 16}")
             self.return_panel.deiconify()
+            self.return_panel.geometry("+16+{}".format(max(16, self.root.winfo_screenheight() - 70)))
             self.return_panel.lift()
         except Exception:
             pass
 
-    def send_dashboard_behind_child(self):
-        self.child_mode = True
+    def hide_return_panel(self):
         try:
-            # Keep the fullscreen dashboard visible behind the approved app/site.
-            # Never lower it behind the desktop; uncovered areas should show this
-            # safe dashboard, not Windows icons, settings, or other programs.
-            self.root.attributes("-topmost", False)
-            self.root.deiconify()
-            if os.name == "nt":
-                try:
-                    self.root.state("zoomed")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self.show_return_panel()
-
-    def return_to_dashboard(self):
-        self.child_mode = False
-        try:
-            if self.return_panel is not None:
+            if self.return_panel:
                 self.return_panel.withdraw()
-            self.root.deiconify()
-            self.root.attributes("-topmost", bool(self.config.get("always_on_top", True)))
-            self.root.lift()
-            self.root.focus_force()
         except Exception:
             pass
 
     def build_ui(self):
-        for child in self.root.winfo_children():
-            child.destroy()
+        for w in self.root.winfo_children():
+            w.destroy()
 
         bg = self.theme("background")
         text = self.theme("text")
         muted = self.theme("muted")
         primary = self.theme("primary")
-        card = self.theme("card")
-        self.root.configure(bg=bg)
 
         top = tk.Frame(self.root, bg=bg)
-        top.pack(fill="x", padx=36, pady=(28, 12))
+        top.pack(fill="x", padx=34, pady=(24, 8))
+        tk.Label(top, text=f"Hi {self.config.get('kid_name', 'Kids')}!", font=("Segoe UI", 34, "bold"), bg=bg, fg=text).pack(side="left")
+        tk.Button(top, text="Parent", command=self.open_parent_mode, bg=primary, fg="white", relief="flat", padx=18, pady=10, font=("Segoe UI", 12, "bold"), cursor="hand2").pack(side="right")
 
-        title = tk.Label(top, text=f"Hi {self.config.get('kid_name', 'Kids')}!", bg=bg, fg=text, font=("Segoe UI", 34, "bold"))
-        title.pack(side="left")
-
-        parent_btn = tk.Button(top, text="Parent", command=self.open_parent_mode, bg=primary, fg="white", relief="flat", padx=18, pady=10, font=("Segoe UI", 12, "bold"), cursor="hand2")
-        parent_btn.pack(side="right")
-
-        subtitle = tk.Label(self.root, text="Choose something fun and safe to open.", bg=bg, fg=muted, font=("Segoe UI", 17))
-        subtitle.pack(anchor="w", padx=40, pady=(0, 18))
+        tk.Label(self.root, text="Choose something safe to open", font=("Segoe UI", 16), bg=bg, fg=muted).pack(pady=(0, 16))
 
         grid = tk.Frame(self.root, bg=bg)
-        grid.pack(fill="both", expand=True, padx=36, pady=12)
+        grid.pack(expand=True)
 
         items = self.config.get("items", [])
         if not items:
-            tk.Label(grid, text="No approved apps or websites yet. Open Parent Mode to add some.", bg=bg, fg=muted, font=("Segoe UI", 18)).pack(pady=80)
+            tk.Label(grid, text="No approved apps yet. Use Parent Mode to add some.", font=("Segoe UI", 18), bg=bg, fg=text).pack()
             return
 
-        cols = 3
+        columns = 3
         for idx, item in enumerate(items):
-            r, c = divmod(idx, cols)
-            grid.grid_columnconfigure(c, weight=1, uniform="col")
-            grid.grid_rowconfigure(r, weight=1)
-            frame = tk.Frame(grid, bg=card, highlightbackground="#dbeafe", highlightthickness=2)
-            frame.grid(row=r, column=c, padx=14, pady=14, sticky="nsew")
-            frame.bind("<Button-1>", lambda _e, i=item: self.launch(i))
+            card = tk.Frame(grid, bg=self.theme("card"), highlightthickness=1, highlightbackground="#dbeafe")
+            r, c = divmod(idx, columns)
+            card.grid(row=r, column=c, padx=16, pady=16, sticky="nsew")
+            btn = tk.Button(
+                card,
+                text=f"{item.get('emoji', '⭐')}\n{item.get('name', 'Untitled')}",
+                command=lambda it=item: self.launch_item(it),
+                width=18,
+                height=6,
+                bg=self.theme("card"),
+                fg=text,
+                relief="flat",
+                font=("Segoe UI", 18, "bold"),
+                cursor="hand2",
+                activebackground="#dbeafe",
+            )
+            btn.pack(padx=10, pady=10)
 
-            emoji = tk.Label(frame, text=item.get("emoji", "⭐"), bg=card, fg=text, font=("Segoe UI Emoji", 44))
-            emoji.pack(pady=(28, 8))
-            emoji.bind("<Button-1>", lambda _e, i=item: self.launch(i))
+        bottom = tk.Frame(self.root, bg=bg)
+        bottom.pack(fill="x", padx=30, pady=20)
+        tk.Label(bottom, text="Manual lockdown mode is on. Parent PIN required to exit.", font=("Segoe UI", 11), bg=bg, fg=muted).pack(side="left")
+        tk.Button(bottom, text="Exit", command=self.ask_exit, bg="#ef4444", fg="white", relief="flat", padx=18, pady=9, font=("Segoe UI", 11, "bold"), cursor="hand2").pack(side="right")
 
-            name = tk.Label(frame, text=item.get("name", "Untitled"), bg=card, fg=text, font=("Segoe UI", 20, "bold"), wraplength=260)
-            name.pack(pady=(6, 4))
-            name.bind("<Button-1>", lambda _e, i=item: self.launch(i))
-
-            kind = "Website" if item.get("type") == "website" else "App"
-            tk.Label(frame, text=kind, bg=card, fg=muted, font=("Segoe UI", 12)).pack()
-
-            open_btn = tk.Button(frame, text="Open", command=lambda i=item: self.launch(i), bg=primary, fg="white", relief="flat", padx=25, pady=8, font=("Segoe UI", 12, "bold"), cursor="hand2")
-            open_btn.pack(pady=20)
-
-        bottom_bar = tk.Frame(self.root, bg=bg)
-        bottom_bar.pack(side="bottom", fill="x", padx=18, pady=8)
-
-        return_btn = tk.Button(bottom_bar, text="← Return to Dashboard", command=self.return_to_dashboard, bg=card, fg=primary, relief="flat", padx=14, pady=7, font=("Segoe UI", 10, "bold"), cursor="hand2")
-        return_btn.pack(side="left")
-
-        footer = tk.Label(bottom_bar, text="Parent shortcut: Ctrl+P or F12", bg=bg, fg=muted, font=("Segoe UI", 10))
-        footer.pack(side="right")
-
-    def launch(self, item: dict):
+    def launch_item(self, item: dict):
         target = item.get("target", "").strip()
         if not target:
-            messagebox.showwarning("Missing target", "This launcher item has no app path or website URL.")
+            messagebox.showerror("Missing target", "This launcher item does not have a target.")
             return
+
+        self.child_mode = True
+        self.hide_return_panel()
+        # Dashboard remains fullscreen behind the app/site as a safe background.
+        self.root.attributes("-topmost", False)
+        self.root.lift()
+        self.root.update_idletasks()
+
         try:
             if item.get("type") == "website":
-                proc = self.launch_website(target)
+                edge = find_edge() if self.config.get("use_edge_app_mode_for_websites", True) else None
+                if edge:
+                    args = [
+                        edge,
+                        f"--app={target}",
+                        "--start-maximized",
+                        "--kiosk-type=fullscreen",
+                        "--no-first-run",
+                        "--disable-features=Translate,msEdgeShoppingAssistantEnabled",
+                    ]
+                    self.active_process = subprocess.Popen(args)
+                else:
+                    # Fallback. Less locked down because browser choice is controlled by Windows.
+                    self.active_process = subprocess.Popen(["cmd", "/c", "start", "", target], shell=False)
             else:
-                proc = self.launch_app(target)
-            self.active_process = proc
-            self.send_dashboard_behind_child()
-            if proc is not None:
-                delayed_focus_process(getattr(proc, "pid", None), fullscreen=True)
+                self.active_process = subprocess.Popen(target, shell=True)
+
+            self.root.after(700, self._after_launch)
+            self.root.after(1600, self._after_launch)
         except Exception as e:
-            messagebox.showerror("Could not open", f"I could not open {item.get('name', 'that item')}:\n{e}")
+            self.child_mode = False
+            self.root.attributes("-topmost", True)
+            messagebox.showerror("Launch error", f"Could not open:\n{target}\n\n{e}")
 
-    def launch_website(self, url: str):
-        if not (url.startswith("http://") or url.startswith("https://")):
-            url = "https://" + url
-        edge = find_edge() if self.config.get("use_edge_app_mode_for_websites", True) else None
-        if edge:
-            # App mode hides the normal browser address bar and makes wandering away harder.
-            subprocess.Popen([edge, f"--app={url}", "--no-first-run"])
-        else:
-            webbrowser.open(url)
+    def _after_launch(self):
+        if self.active_process and getattr(self.active_process, "pid", None):
+            bring_pid_to_front(self.active_process.pid, fullscreen=True)
+        self.show_return_panel()
 
-    def launch_app(self, target: str):
-        # Supports either a full path like C:\\Windows\\System32\\notepad.exe or a command like mspaint.exe.
-        subprocess.Popen(target, shell=True)
+    def return_to_dashboard(self):
+        self.child_mode = False
+        self.hide_return_panel()
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.attributes("-fullscreen", bool(self.config.get("lock_fullscreen", True)))
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
 
-    def check_pin(self) -> bool:
-        d = PinDialog(self.root)
-        if d.result is None:
-            return False
-        if sha(d.result) == self.config.get("pin_hash"):
-            return True
-        messagebox.showerror("Wrong PIN", "That PIN was not correct.")
-        return False
+    def verify_pin(self, title="Parent PIN") -> bool:
+        dlg = PinDialog(self.root, title)
+        return bool(dlg.result) and sha(dlg.result) == self.config.get("pin_hash")
 
     def ask_exit(self):
-        if self.check_pin():
+        self.return_to_dashboard()
+        if self.verify_pin("Exit launcher"):
+            self.keyboard_blocker.stop()
             self.root.destroy()
+        return "break"
 
     def open_parent_mode(self):
-        if not self.check_pin():
-            return
+        self.return_to_dashboard()
+        if not self.verify_pin("Parent Mode"):
+            return "break"
         ParentWindow(self)
+        return "break"
 
     def run(self):
         self.root.mainloop()
+        self.keyboard_blocker.stop()
 
 
 class ParentWindow(Toplevel):
     def __init__(self, app: KidLauncher):
         super().__init__(app.root)
         self.app = app
-        self.config = app.config
         self.title("Parent Mode")
-        self.geometry("850x610")
+        self.geometry("760x560")
+        self.configure(bg="white")
         self.transient(app.root)
         self.grab_set()
-        self.configure(bg="#ffffff")
-        self.build()
+        self.focus_force()
 
-    def build(self):
-        tabs = ttk.Notebook(self)
-        tabs.pack(fill="both", expand=True, padx=12, pady=12)
-        self.items_tab = ttk.Frame(tabs)
-        self.settings_tab = ttk.Frame(tabs)
-        tabs.add(self.items_tab, text="Allowed Apps & Websites")
-        tabs.add(self.settings_tab, text="Settings")
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=12, pady=12)
+        self.items_tab = tk.Frame(nb, bg="white")
+        self.settings_tab = tk.Frame(nb, bg="white")
+        nb.add(self.items_tab, text="Approved apps/sites")
+        nb.add(self.settings_tab, text="Settings")
         self.build_items_tab()
         self.build_settings_tab()
 
     def build_items_tab(self):
-        top = ttk.Frame(self.items_tab)
-        top.pack(fill="x", pady=8)
-        ttk.Button(top, text="Add Website", command=lambda: self.edit_item("website")).pack(side="left", padx=4)
-        ttk.Button(top, text="Add App", command=lambda: self.edit_item("app")).pack(side="left", padx=4)
-        ttk.Button(top, text="Edit Selected", command=self.edit_selected).pack(side="left", padx=4)
-        ttk.Button(top, text="Remove Selected", command=self.remove_selected).pack(side="left", padx=4)
-        ttk.Button(top, text="Save & Close", command=self.save_close).pack(side="right", padx=4)
+        left = tk.Frame(self.items_tab, bg="white")
+        left.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        self.listbox = tk.Listbox(left, font=("Segoe UI", 12), height=16)
+        self.listbox.pack(fill="both", expand=True)
+        self.refresh_list()
 
-        cols = ("name", "type", "target")
-        self.tree = ttk.Treeview(self.items_tab, columns=cols, show="headings", height=18)
-        for col, label, width in [("name", "Name", 180), ("type", "Type", 90), ("target", "Target", 480)]:
-            self.tree.heading(col, text=label)
-            self.tree.column(col, width=width)
-        self.tree.pack(fill="both", expand=True)
-        self.refresh_tree()
+        right = tk.Frame(self.items_tab, bg="white")
+        right.pack(side="right", fill="y", padx=10, pady=10)
+        tk.Button(right, text="Add Website", command=lambda: self.edit_item({"type": "website", "emoji": "🌐"}), width=18).pack(pady=5)
+        tk.Button(right, text="Add App", command=self.add_app, width=18).pack(pady=5)
+        tk.Button(right, text="Edit Selected", command=self.edit_selected, width=18).pack(pady=5)
+        tk.Button(right, text="Remove Selected", command=self.remove_selected, width=18).pack(pady=5)
+        tk.Button(right, text="Close", command=self.destroy, width=18).pack(pady=(30, 5))
 
-    def refresh_tree(self):
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        for idx, item in enumerate(self.config.get("items", [])):
-            self.tree.insert("", "end", iid=str(idx), values=(item.get("name"), item.get("type"), item.get("target")))
+    def refresh_list(self):
+        self.listbox.delete(0, "end")
+        for item in self.app.config.get("items", []):
+            self.listbox.insert("end", f"{item.get('emoji','⭐')}  {item.get('name')}  [{item.get('type')}]  {item.get('target')}")
 
     def selected_index(self):
-        sel = self.tree.selection()
-        return int(sel[0]) if sel else None
+        sel = self.listbox.curselection()
+        return sel[0] if sel else None
+
+    def add_app(self):
+        path = filedialog.askopenfilename(title="Choose an app", filetypes=[("Programs", "*.exe *.bat *.cmd"), ("All files", "*.*")])
+        if path:
+            self.edit_item({"type": "app", "target": path, "name": Path(path).stem, "emoji": "🎮"})
 
     def edit_selected(self):
         idx = self.selected_index()
         if idx is None:
-            messagebox.showinfo("Select one", "Please select an item first.")
             return
-        self.edit_item(existing_index=idx)
+        self.edit_item(dict(self.app.config["items"][idx]), idx)
 
     def remove_selected(self):
         idx = self.selected_index()
         if idx is None:
-            messagebox.showinfo("Select one", "Please select an item first.")
             return
-        del self.config["items"][idx]
-        self.refresh_tree()
+        del self.app.config["items"][idx]
+        save_config(self.app.config)
+        self.refresh_list()
+        self.app.build_ui()
 
-    def edit_item(self, item_type="website", existing_index=None):
-        item = None if existing_index is None else self.config["items"][existing_index]
+    def edit_item(self, item, idx=None):
         win = Toplevel(self)
         win.title("Launcher Item")
-        win.geometry("610x315")
+        win.geometry("560x300")
+        win.configure(bg="white")
         win.transient(self)
         win.grab_set()
 
-        typ = StringVar(value=(item or {}).get("type", item_type))
-        name = StringVar(value=(item or {}).get("name", ""))
-        target = StringVar(value=(item or {}).get("target", ""))
-        emoji = StringVar(value=(item or {}).get("emoji", "⭐"))
+        name = StringVar(value=item.get("name", ""))
+        typ = StringVar(value=item.get("type", "website"))
+        target = StringVar(value=item.get("target", ""))
+        emoji = StringVar(value=item.get("emoji", "⭐"))
 
-        form = ttk.Frame(win, padding=16)
-        form.pack(fill="both", expand=True)
-        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(form, textvariable=name).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Label(form, text="Emoji").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(form, textvariable=emoji).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Label(form, text="Type").grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Combobox(form, textvariable=typ, values=["website", "app"], state="readonly").grid(row=2, column=1, sticky="ew", pady=6)
-        ttk.Label(form, text="Website URL or App Path").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(form, textvariable=target).grid(row=3, column=1, sticky="ew", pady=6)
-        form.grid_columnconfigure(1, weight=1)
-
-        def browse():
-            path = filedialog.askopenfilename(title="Choose app", filetypes=[("Programs", "*.exe *.bat *.cmd"), ("All files", "*.*")])
-            if path:
-                typ.set("app")
-                target.set(path)
-
-        ttk.Button(form, text="Browse for App", command=browse).grid(row=4, column=1, sticky="w", pady=8)
+        form = tk.Frame(win, bg="white")
+        form.pack(fill="both", expand=True, padx=20, pady=20)
+        for row, (label, var) in enumerate([("Name", name), ("Type", typ), ("Target URL/path", target), ("Emoji", emoji)]):
+            tk.Label(form, text=label, bg="white", font=("Segoe UI", 11, "bold")).grid(row=row, column=0, sticky="w", pady=8)
+            if label == "Type":
+                ttk.Combobox(form, textvariable=var, values=["website", "app"], state="readonly", width=40).grid(row=row, column=1, sticky="ew", pady=8)
+            else:
+                tk.Entry(form, textvariable=var, font=("Segoe UI", 11), width=44).grid(row=row, column=1, sticky="ew", pady=8)
+        form.columnconfigure(1, weight=1)
 
         def save():
-            if not name.get().strip() or not target.get().strip():
-                messagebox.showerror("Missing info", "Name and target are required.")
-                return
-            new_item = {"name": name.get().strip(), "type": typ.get(), "target": target.get().strip(), "emoji": emoji.get().strip() or "⭐"}
-            if existing_index is None:
-                self.config.setdefault("items", []).append(new_item)
+            new_item = {"name": name.get().strip() or "Untitled", "type": typ.get(), "target": target.get().strip(), "emoji": emoji.get().strip() or "⭐"}
+            if idx is None:
+                self.app.config.setdefault("items", []).append(new_item)
             else:
-                self.config["items"][existing_index] = new_item
-            self.refresh_tree()
+                self.app.config["items"][idx] = new_item
+            save_config(self.app.config)
+            self.refresh_list()
+            self.app.build_ui()
             win.destroy()
 
-        ttk.Button(form, text="Cancel", command=win.destroy).grid(row=5, column=0, pady=18)
-        ttk.Button(form, text="Save", command=save).grid(row=5, column=1, sticky="e", pady=18)
+        tk.Button(win, text="Save", command=save, width=12).pack(side="right", padx=20, pady=16)
+        tk.Button(win, text="Cancel", command=win.destroy, width=12).pack(side="right", pady=16)
 
     def build_settings_tab(self):
-        frame = ttk.Frame(self.settings_tab, padding=18)
-        frame.pack(fill="both", expand=True)
-        self.kid_name = StringVar(value=self.config.get("kid_name", "Kids"))
-        self.fullscreen = BooleanVar(value=bool(self.config.get("lock_fullscreen", True)))
-        self.topmost = BooleanVar(value=bool(self.config.get("always_on_top", True)))
-        self.edge_mode = BooleanVar(value=bool(self.config.get("use_edge_app_mode_for_websites", True)))
-        self.new_pin = StringVar()
+        cfg = self.app.config
+        bg = "white"
+        frame = tk.Frame(self.settings_tab, bg=bg)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ttk.Label(frame, text="Kid display name").grid(row=0, column=0, sticky="w", pady=8)
-        ttk.Entry(frame, textvariable=self.kid_name).grid(row=0, column=1, sticky="ew", pady=8)
-        ttk.Checkbutton(frame, text="Fullscreen lock", variable=self.fullscreen).grid(row=1, column=1, sticky="w", pady=8)
-        ttk.Checkbutton(frame, text="Keep launcher always on top", variable=self.topmost).grid(row=2, column=1, sticky="w", pady=8)
-        ttk.Checkbutton(frame, text="Open websites in Microsoft Edge app mode", variable=self.edge_mode).grid(row=3, column=1, sticky="w", pady=8)
-        ttk.Label(frame, text="New parent PIN").grid(row=4, column=0, sticky="w", pady=8)
-        ttk.Entry(frame, textvariable=self.new_pin, show="•").grid(row=4, column=1, sticky="ew", pady=8)
-        ttk.Label(frame, text="Leave blank to keep current PIN. Default PIN is 1234.").grid(row=5, column=1, sticky="w", pady=2)
-        ttk.Button(frame, text="Save Settings", command=self.save_settings).grid(row=6, column=1, sticky="e", pady=24)
-        frame.grid_columnconfigure(1, weight=1)
+        kid_name = StringVar(value=cfg.get("kid_name", "Kids"))
+        lock_full = BooleanVar(value=cfg.get("lock_fullscreen", True))
+        topmost = BooleanVar(value=cfg.get("always_on_top", True))
+        block_keys = BooleanVar(value=cfg.get("block_escape_keys", True))
+        edge_mode = BooleanVar(value=cfg.get("use_edge_app_mode_for_websites", True))
+        new_pin = StringVar()
 
-    def save_settings(self):
-        self.config["kid_name"] = self.kid_name.get().strip() or "Kids"
-        self.config["lock_fullscreen"] = bool(self.fullscreen.get())
-        self.config["always_on_top"] = bool(self.topmost.get())
-        self.config["use_edge_app_mode_for_websites"] = bool(self.edge_mode.get())
-        if self.new_pin.get().strip():
-            self.config["pin_hash"] = sha(self.new_pin.get().strip())
-        save_config(self.config)
-        self.app.config = self.config
-        self.app.apply_window_mode()
-        self.app.build_ui()
-        self.app.create_return_panel()
-        messagebox.showinfo("Saved", "Settings saved.")
+        rows = [
+            ("Kid name", tk.Entry(frame, textvariable=kid_name, width=34)),
+            ("Fullscreen launcher", tk.Checkbutton(frame, variable=lock_full, bg=bg)),
+            ("Keep dashboard on top", tk.Checkbutton(frame, variable=topmost, bg=bg)),
+            ("Block escape keys", tk.Checkbutton(frame, variable=block_keys, bg=bg)),
+            ("Use Edge app mode for websites", tk.Checkbutton(frame, variable=edge_mode, bg=bg)),
+            ("New PIN (leave blank to keep)", tk.Entry(frame, textvariable=new_pin, show="•", width=34)),
+        ]
+        for i, (label, widget) in enumerate(rows):
+            tk.Label(frame, text=label, bg=bg, font=("Segoe UI", 11, "bold")).grid(row=i, column=0, sticky="w", pady=10)
+            widget.grid(row=i, column=1, sticky="w", pady=10)
 
-    def save_close(self):
-        save_config(self.config)
-        self.app.config = self.config
-        self.app.apply_window_mode()
-        self.app.build_ui()
-        self.app.create_return_panel()
-        self.destroy()
+        note = (
+            "Keyboard blocking catches Alt+Tab, Alt+Esc, Alt+F4, Ctrl+Esc, and Windows keys. "
+            "Windows does not allow normal apps to block Ctrl+Alt+Del. For maximum safety, use a standard child Windows account."
+        )
+        tk.Label(frame, text=note, wraplength=560, justify="left", bg=bg, fg="#64748b", font=("Segoe UI", 10)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(16, 8))
+
+        def save_settings():
+            cfg["kid_name"] = kid_name.get().strip() or "Kids"
+            cfg["lock_fullscreen"] = bool(lock_full.get())
+            cfg["always_on_top"] = bool(topmost.get())
+            cfg["block_escape_keys"] = bool(block_keys.get())
+            cfg["use_edge_app_mode_for_websites"] = bool(edge_mode.get())
+            if new_pin.get().strip():
+                cfg["pin_hash"] = sha(new_pin.get().strip())
+            save_config(cfg)
+            if cfg["block_escape_keys"]:
+                self.app.keyboard_blocker.start()
+            else:
+                self.app.keyboard_blocker.stop()
+            self.app.apply_window_mode()
+            self.app.build_ui()
+            messagebox.showinfo("Saved", "Settings saved.")
+
+        tk.Button(frame, text="Save Settings", command=save_settings, width=16).grid(row=7, column=1, sticky="e", pady=20)
 
 
 if __name__ == "__main__":

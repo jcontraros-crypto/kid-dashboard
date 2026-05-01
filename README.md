@@ -1,8 +1,6 @@
-# Kid Safe Launcher v3
+# Kid Safe Launcher - Manual Lockdown Edition
 
-A simple Python/Tkinter kid-safe dashboard for Windows.
-
-## Run
+Run manually:
 
 ```bash
 python kid_launcher.py
@@ -10,21 +8,41 @@ python kid_launcher.py
 
 Default parent PIN: `1234`
 
-## What changed in v3
+## What this version adds
 
-- Approved websites/apps are opened maximized/fullscreen where possible.
-- The dashboard is no longer lowered behind the Windows desktop.
-- When an approved app/site is open, the fullscreen dashboard stays behind it as a safe background.
-- A small always-on-top **← Dashboard** button remains in the bottom-left corner.
-- Websites opened with Microsoft Edge use app mode plus fullscreen startup flags.
+- Still **does not launch on startup**. You manually start it when you want kid mode.
+- Fullscreen dashboard stays as the safe background.
+- Parent PIN required for Parent Mode or Exit.
+- Approved websites open in Microsoft Edge app/fullscreen style when Edge is installed.
+- Approved apps are launched and then maximized where Windows allows it.
+- Small always-on-top **← Dashboard** button appears while an approved app/site is open.
+- Blocks common escape shortcuts while running:
+  - Alt+Tab
+  - Alt+Esc
+  - Alt+F4
+  - Ctrl+Esc
+  - Left/Right Windows key
 
-## Important lockdown note
+## Important Windows limitation
 
-This is a guided launcher, not a complete Windows security boundary. For stronger kid-safety, use:
+A normal Python app cannot fully block **Ctrl+Alt+Del**, Task Manager launched from the secure Windows screen, power buttons, or OS-level accessibility/security dialogs. Windows intentionally protects those shortcuts.
 
-1. A separate standard Windows child account, not an administrator account.
-2. Microsoft Family Safety web/app restrictions.
-3. Optional Windows kiosk/assigned access mode.
-4. Remove taskbar shortcuts and disable unnecessary startup apps.
+For the strongest practical kid-safe setup, use this launcher with:
 
-This launcher is designed to make the experience simple and contained, but Windows keyboard shortcuts like Alt+Tab, Ctrl+Alt+Del, and system dialogs cannot be fully blocked by normal Python apps.
+1. A separate **standard** Windows child account, not an administrator account.
+2. Microsoft Family Safety or browser family settings.
+3. No desktop shortcuts except this launcher.
+4. A PIN/password your kids do not know.
+
+## Parent controls
+
+Inside the launcher:
+
+- Click **Parent** or press `F12` / `Ctrl+P`.
+- Enter the parent PIN.
+- Add/edit/remove approved apps and websites.
+- Change the PIN and lockdown options.
+
+## Notes for Netflix and other sites
+
+Websites work best with Microsoft Edge installed. The launcher uses Edge's app-style window so kids do not see a normal address bar. Some streaming services may still show their own internal links or account screens.
