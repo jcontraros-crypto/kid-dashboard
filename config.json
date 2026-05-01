@@ -1,0 +1,40 @@
+{
+  "pin_hash": "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4",
+  "kid_name": "Kids",
+  "lock_fullscreen": true,
+  "always_on_top": true,
+  "use_edge_app_mode_for_websites": true,
+  "theme": {
+    "background": "#eaf7ff",
+    "card": "#ffffff",
+    "primary": "#2563eb",
+    "text": "#1f2937",
+    "muted": "#64748b"
+  },
+  "items": [
+    {
+      "name": "PBS Kids",
+      "type": "website",
+      "target": "https://pbskids.org",
+      "emoji": "\ud83c\udf08"
+    },
+    {
+      "name": "Khan Academy Kids",
+      "type": "website",
+      "target": "https://learn.khanacademy.org/khan-academy-kids/",
+      "emoji": "\ud83d\udcda"
+    },
+    {
+      "name": "Paint",
+      "type": "app",
+      "target": "mspaint.exe",
+      "emoji": "\ud83c\udfa8"
+    },
+    {
+      "name": "Netflix",
+      "type": "website",
+      "target": "http://www.netflix.com",
+      "emoji": "\u2b50"
+    }
+  ]
+}
