@@ -13,6 +13,7 @@ import sys
 import hashlib
 import subprocess
 import webbrowser
+import time
 from pathlib import Path
 from tkinter import Tk, Toplevel, StringVar, BooleanVar, messagebox, filedialog
 import tkinter as tk
@@ -96,6 +97,50 @@ def find_edge() -> str | None:
     return None
 
 
+# Best-effort Windows window control. If it fails, the launcher still works;
+# it just cannot force the approved window to maximize/focus.
+def bring_process_windows_forward(pid: int | None, fullscreen: bool = False) -> None:
+    if os.name != "nt" or not pid:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        SW_SHOWMAXIMIZED = 3
+        SW_RESTORE = 9
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        hwnds = []
+
+        def callback(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            found_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(found_pid))
+            if found_pid.value == pid:
+                hwnds.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(callback), 0)
+        for hwnd in hwnds:
+            user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED if fullscreen else SW_RESTORE)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def delayed_focus_process(pid: int | None, fullscreen: bool = True, attempts: int = 12, delay: float = 0.35) -> None:
+    import threading
+
+    def worker():
+        for _ in range(attempts):
+            time.sleep(delay)
+            bring_process_windows_forward(pid, fullscreen=fullscreen)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 class PinDialog(Toplevel):
     def __init__(self, parent, title="Parent PIN"):
         super().__init__(parent)
@@ -137,8 +182,12 @@ class KidLauncher:
         self.root.bind("<Control-q>", lambda e: self.ask_exit())
         self.root.bind("<Control-p>", lambda e: self.open_parent_mode())
         self.root.bind("<F12>", lambda e: self.open_parent_mode())
+        self.child_mode = False
+        self.active_process = None
+        self.return_panel = None
         self.apply_window_mode()
         self.build_ui()
+        self.create_return_panel()
         self.keep_front()
 
     def theme(self, key):
@@ -153,13 +202,87 @@ class KidLauncher:
             self.root.geometry("1000x700")
 
     def keep_front(self):
-        if self.config.get("always_on_top", True):
+        # Keep dashboard on top only while the child is choosing from the dashboard.
+        # Once an approved app/site opens, the dashboard goes behind it and a small
+        # floating Return button is shown instead.
+        if not self.child_mode and self.config.get("always_on_top", True):
             try:
+                self.root.attributes("-topmost", True)
                 self.root.lift()
                 self.root.focus_force()
             except Exception:
                 pass
         self.root.after(2500, self.keep_front)
+
+    def create_return_panel(self):
+        if self.return_panel is not None:
+            try:
+                self.return_panel.destroy()
+            except Exception:
+                pass
+        self.return_panel = Toplevel(self.root)
+        self.return_panel.withdraw()
+        self.return_panel.overrideredirect(True)
+        self.return_panel.attributes("-topmost", True)
+        self.return_panel.configure(bg=self.theme("primary"))
+        btn = tk.Button(
+            self.return_panel,
+            text="← Dashboard",
+            command=self.return_to_dashboard,
+            bg=self.theme("primary"),
+            fg="white",
+            activebackground=self.theme("primary"),
+            activeforeground="white",
+            relief="flat",
+            padx=18,
+            pady=10,
+            font=("Segoe UI", 12, "bold"),
+            cursor="hand2",
+        )
+        btn.pack()
+
+    def show_return_panel(self):
+        if self.return_panel is None:
+            self.create_return_panel()
+        try:
+            self.return_panel.update_idletasks()
+            w = self.return_panel.winfo_reqwidth()
+            h = self.return_panel.winfo_reqheight()
+            screen_h = self.root.winfo_screenheight()
+            self.return_panel.geometry(f"{w}x{h}+16+{screen_h - h - 16}")
+            self.return_panel.deiconify()
+            self.return_panel.lift()
+        except Exception:
+            pass
+
+    def send_dashboard_behind_child(self):
+        self.child_mode = True
+        try:
+            # Keep the fullscreen dashboard visible behind the approved app/site.
+            # Never lower it behind the desktop; uncovered areas should show this
+            # safe dashboard, not Windows icons, settings, or other programs.
+            self.root.attributes("-topmost", False)
+            self.root.deiconify()
+            if os.name == "nt":
+                try:
+                    self.root.state("zoomed")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.show_return_panel()
+
+    def return_to_dashboard(self):
+        self.child_mode = False
+        try:
+            if self.return_panel is not None:
+                self.return_panel.withdraw()
+            self.root.deiconify()
+            self.root.attributes("-topmost", bool(self.config.get("always_on_top", True)))
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
 
     def build_ui(self):
         for child in self.root.winfo_children():
@@ -215,8 +338,14 @@ class KidLauncher:
             open_btn = tk.Button(frame, text="Open", command=lambda i=item: self.launch(i), bg=primary, fg="white", relief="flat", padx=25, pady=8, font=("Segoe UI", 12, "bold"), cursor="hand2")
             open_btn.pack(pady=20)
 
-        footer = tk.Label(self.root, text="Parent shortcut: Ctrl+P or F12", bg=bg, fg=muted, font=("Segoe UI", 10))
-        footer.pack(side="bottom", pady=8)
+        bottom_bar = tk.Frame(self.root, bg=bg)
+        bottom_bar.pack(side="bottom", fill="x", padx=18, pady=8)
+
+        return_btn = tk.Button(bottom_bar, text="← Return to Dashboard", command=self.return_to_dashboard, bg=card, fg=primary, relief="flat", padx=14, pady=7, font=("Segoe UI", 10, "bold"), cursor="hand2")
+        return_btn.pack(side="left")
+
+        footer = tk.Label(bottom_bar, text="Parent shortcut: Ctrl+P or F12", bg=bg, fg=muted, font=("Segoe UI", 10))
+        footer.pack(side="right")
 
     def launch(self, item: dict):
         target = item.get("target", "").strip()
@@ -225,9 +354,13 @@ class KidLauncher:
             return
         try:
             if item.get("type") == "website":
-                self.launch_website(target)
+                proc = self.launch_website(target)
             else:
-                self.launch_app(target)
+                proc = self.launch_app(target)
+            self.active_process = proc
+            self.send_dashboard_behind_child()
+            if proc is not None:
+                delayed_focus_process(getattr(proc, "pid", None), fullscreen=True)
         except Exception as e:
             messagebox.showerror("Could not open", f"I could not open {item.get('name', 'that item')}:\n{e}")
 
@@ -410,6 +543,7 @@ class ParentWindow(Toplevel):
         self.app.config = self.config
         self.app.apply_window_mode()
         self.app.build_ui()
+        self.app.create_return_panel()
         messagebox.showinfo("Saved", "Settings saved.")
 
     def save_close(self):
@@ -417,6 +551,7 @@ class ParentWindow(Toplevel):
         self.app.config = self.config
         self.app.apply_window_mode()
         self.app.build_ui()
+        self.app.create_return_panel()
         self.destroy()
 
 
