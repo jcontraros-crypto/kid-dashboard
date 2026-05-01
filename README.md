@@ -13,9 +13,10 @@ Default parent PIN: `1234`
 - Still **does not launch on startup**. You manually start it when you want kid mode.
 - Fullscreen dashboard stays as the safe background.
 - Parent PIN required for Parent Mode or Exit.
-- Approved websites open in Microsoft Edge app/fullscreen style when Edge is installed.
+- Approved websites open in Microsoft Edge kiosk fullscreen mode when Edge is installed.
 - Approved apps are launched and then maximized where Windows allows it.
 - Small always-on-top **← Dashboard** button appears while an approved app/site is open.
+- Blocks right-click/context menus where Python/Windows permits.
 - Blocks common escape shortcuts while running:
   - Alt+Tab
   - Alt+Esc
@@ -45,4 +46,4 @@ Inside the launcher:
 
 ## Notes for Netflix and other sites
 
-Websites work best with Microsoft Edge installed. The launcher uses Edge's app-style window so kids do not see a normal address bar. Some streaming services may still show their own internal links or account screens.
+Websites work best with Microsoft Edge installed. The launcher uses Edge kiosk fullscreen mode so kids do not see a normal address bar or normal browser controls. Some streaming services may still show their own internal links or account screens.

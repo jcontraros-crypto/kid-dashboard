@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
     "lock_fullscreen": True,
     "always_on_top": True,
     "block_escape_keys": True,
+    "block_right_click": True,
     "use_edge_app_mode_for_websites": True,
     "theme": {
         "background": "#eaf7ff",
@@ -212,6 +213,76 @@ class KeyboardBlocker:
             self.hooked = False
 
 
+class MouseBlocker:
+    """Blocks right-click/context menu mouse actions while the launcher is running.
+
+    This uses a low-level Windows mouse hook so right-click menus are suppressed
+    in the launcher and, where Windows permits, in launched child windows too.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.hooked = False
+        self.thread = None
+        self._hook = None
+        self._proc = None
+
+    def start(self):
+        if os.name != "nt" or self.hooked:
+            return
+        self.enabled = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.enabled = False
+        if os.name == "nt" and self._hook:
+            try:
+                ctypes.windll.user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+        self._hook = None
+        self.hooked = False
+
+    def _run(self):
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            WH_MOUSE_LL = 14
+            WM_RBUTTONDOWN = 0x0204
+            WM_RBUTTONUP = 0x0205
+            WM_RBUTTONDBLCLK = 0x0206
+            WM_NCRBUTTONDOWN = 0x00A4
+            WM_NCRBUTTONUP = 0x00A5
+            WM_NCRBUTTONDBLCLK = 0x00A6
+
+            LowLevelMouseProc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+            def hook_proc(nCode, wParam, lParam):
+                if nCode == 0 and self.enabled and wParam in (
+                    WM_RBUTTONDOWN,
+                    WM_RBUTTONUP,
+                    WM_RBUTTONDBLCLK,
+                    WM_NCRBUTTONDOWN,
+                    WM_NCRBUTTONUP,
+                    WM_NCRBUTTONDBLCLK,
+                ):
+                    return 1
+                return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+            self._proc = LowLevelMouseProc(hook_proc)
+            self._hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
+            self.hooked = bool(self._hook)
+            msg = ctypes.wintypes.MSG()
+            while self.enabled:
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                time.sleep(0.01)
+        except Exception:
+            self.hooked = False
+
+
 class PinDialog(Toplevel):
     def __init__(self, parent, title="Parent PIN"):
         super().__init__(parent)
@@ -258,12 +329,26 @@ class KidLauncher:
         self.active_process = None
         self.return_panel = None
         self.keyboard_blocker = KeyboardBlocker()
+        self.mouse_blocker = MouseBlocker()
+        self.block_context_menus()
         if self.config.get("block_escape_keys", True):
             self.keyboard_blocker.start()
+        if self.config.get("block_right_click", True):
+            self.mouse_blocker.start()
         self.apply_window_mode()
         self.build_ui()
         self.create_return_panel()
         self.keep_front()
+        self.keep_return_panel_front()
+
+    def block_context_menus(self):
+        def block(_event=None):
+            return "break"
+        for sequence in ("<Button-3>", "<ButtonRelease-3>", "<Shift-F10>", "<KeyPress-Menu>", "<KeyPress-App>"):
+            try:
+                self.root.bind_all(sequence, block)
+            except Exception:
+                pass
 
     def theme(self, key):
         return self.config.get("theme", DEFAULT_CONFIG["theme"]).get(key, DEFAULT_CONFIG["theme"].get(key))
@@ -286,6 +371,15 @@ class KidLauncher:
         except Exception:
             pass
         self.root.after(1200, self.keep_front)
+
+    def keep_return_panel_front(self):
+        try:
+            if self.child_mode and self.return_panel:
+                self.return_panel.attributes("-topmost", True)
+                self.return_panel.lift()
+        except Exception:
+            pass
+        self.root.after(500, self.keep_return_panel_front)
 
     def create_return_panel(self):
         try:
@@ -399,9 +493,10 @@ class KidLauncher:
                 if edge:
                     args = [
                         edge,
-                        f"--app={target}",
-                        "--start-maximized",
-                        "--kiosk-type=fullscreen",
+                        "--kiosk",
+                        target,
+                        "--edge-kiosk-type=fullscreen",
+                        "--start-fullscreen",
                         "--no-first-run",
                         "--disable-features=Translate,msEdgeShoppingAssistantEnabled",
                     ]
@@ -444,6 +539,7 @@ class KidLauncher:
         self.return_to_dashboard()
         if self.verify_pin("Exit launcher"):
             self.keyboard_blocker.stop()
+            self.mouse_blocker.stop()
             self.root.destroy()
         return "break"
 
@@ -457,6 +553,7 @@ class KidLauncher:
     def run(self):
         self.root.mainloop()
         self.keyboard_blocker.stop()
+        self.mouse_blocker.stop()
 
 
 class ParentWindow(Toplevel):
@@ -570,6 +667,7 @@ class ParentWindow(Toplevel):
         lock_full = BooleanVar(value=cfg.get("lock_fullscreen", True))
         topmost = BooleanVar(value=cfg.get("always_on_top", True))
         block_keys = BooleanVar(value=cfg.get("block_escape_keys", True))
+        block_right = BooleanVar(value=cfg.get("block_right_click", True))
         edge_mode = BooleanVar(value=cfg.get("use_edge_app_mode_for_websites", True))
         new_pin = StringVar()
 
@@ -578,7 +676,8 @@ class ParentWindow(Toplevel):
             ("Fullscreen launcher", tk.Checkbutton(frame, variable=lock_full, bg=bg)),
             ("Keep dashboard on top", tk.Checkbutton(frame, variable=topmost, bg=bg)),
             ("Block escape keys", tk.Checkbutton(frame, variable=block_keys, bg=bg)),
-            ("Use Edge app mode for websites", tk.Checkbutton(frame, variable=edge_mode, bg=bg)),
+            ("Block right-click menus", tk.Checkbutton(frame, variable=block_right, bg=bg)),
+            ("Use Edge kiosk mode for websites", tk.Checkbutton(frame, variable=edge_mode, bg=bg)),
             ("New PIN (leave blank to keep)", tk.Entry(frame, textvariable=new_pin, show="•", width=34)),
         ]
         for i, (label, widget) in enumerate(rows):
@@ -586,7 +685,7 @@ class ParentWindow(Toplevel):
             widget.grid(row=i, column=1, sticky="w", pady=10)
 
         note = (
-            "Keyboard blocking catches Alt+Tab, Alt+Esc, Alt+F4, Ctrl+Esc, and Windows keys. "
+            "Keyboard blocking catches Alt+Tab, Alt+Esc, Alt+F4, Ctrl+Esc, and Windows keys. Right-click blocking suppresses context menus where Windows permits. "
             "Windows does not allow normal apps to block Ctrl+Alt+Del. For maximum safety, use a standard child Windows account."
         )
         tk.Label(frame, text=note, wraplength=560, justify="left", bg=bg, fg="#64748b", font=("Segoe UI", 10)).grid(row=6, column=0, columnspan=2, sticky="w", pady=(16, 8))
@@ -596,6 +695,7 @@ class ParentWindow(Toplevel):
             cfg["lock_fullscreen"] = bool(lock_full.get())
             cfg["always_on_top"] = bool(topmost.get())
             cfg["block_escape_keys"] = bool(block_keys.get())
+            cfg["block_right_click"] = bool(block_right.get())
             cfg["use_edge_app_mode_for_websites"] = bool(edge_mode.get())
             if new_pin.get().strip():
                 cfg["pin_hash"] = sha(new_pin.get().strip())
@@ -604,6 +704,10 @@ class ParentWindow(Toplevel):
                 self.app.keyboard_blocker.start()
             else:
                 self.app.keyboard_blocker.stop()
+            if cfg.get("block_right_click", True):
+                self.app.mouse_blocker.start()
+            else:
+                self.app.mouse_blocker.stop()
             self.app.apply_window_mode()
             self.app.build_ui()
             messagebox.showinfo("Saved", "Settings saved.")
